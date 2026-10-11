@@ -52,7 +52,8 @@ tests:
       grid.id: lab
       gateway.consumerConfig:
         enabled: true
-        deriveTopology: true
+        deriveTopology:
+          fromProviders: [qwen3]
     release:
       namespace: grid
     asserts:
@@ -64,7 +65,8 @@ tests:
               localSiteName: east
               consumerConfig:
                 enabled: true
-                deriveTopology: true
+                deriveTopology:
+                  fromProviders: [qwen3]
 
   - it: renders this site's GridSite named after it
     template: templates/gridsite.yaml
