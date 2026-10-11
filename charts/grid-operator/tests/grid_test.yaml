@@ -45,6 +45,27 @@ tests:
               caSecretRef: {name: grid-ca, namespace: grid}
               swimKeyRef: {name: grid-swim-key, namespace: grid}
 
+  - it: passes gateway.consumerConfig through to the site gateway reference
+    template: templates/gridnetwork.yaml
+    set:
+      site.name: east
+      grid.id: lab
+      gateway.consumerConfig:
+        enabled: true
+        deriveTopology: true
+    release:
+      namespace: grid
+    asserts:
+      - equal:
+          path: spec.gatewayRefs
+          value:
+            - name: grid-gateway
+              namespace: grid
+              localSiteName: east
+              consumerConfig:
+                enabled: true
+                deriveTopology: true
+
   - it: renders this site's GridSite named after it
     template: templates/gridsite.yaml
     set:
