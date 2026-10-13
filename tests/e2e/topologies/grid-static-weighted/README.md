@@ -106,7 +106,7 @@ image; triggered CI pins it to
 cargo build -p forge
 IMAGE_TAG="grid-static-weighted-$(date -u +%Y%m%d%H%M%S)"
 docker build -f deploy/operator/Containerfile -t "grid-operator:${IMAGE_TAG}" .
-docker build -f overlay-sync/Containerfile -t "grid-overlay-sync:${IMAGE_TAG}" .
+docker build -f crates/overlay-sync/Containerfile -t "grid-overlay-sync:${IMAGE_TAG}" .
 
 # From the compatible Praxis AI repository root.
 docker build -f Containerfile -t "praxis-ai:${IMAGE_TAG}" .
