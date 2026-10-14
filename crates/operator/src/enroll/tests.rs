@@ -637,12 +637,28 @@ async fn an_identity_stored_concurrently_wins_and_ours_is_discarded() {
 }
 
 #[test]
+fn recovery_messages_name_both_roles_for_a_new_invite() {
+    for error in [
+        EnrollError::TokenRejected("spent".into()),
+        EnrollError::NameDeleted("deleted".into()),
+    ] {
+        let message = error.to_string();
+        assert!(
+            message.contains("allowDeletedName as a grid-admin that also holds enrollment-admin"),
+            "recovery must describe both required roles: {message}"
+        );
+    }
+}
+
+#[test]
 fn responses_classify_as_done_or_hard_failures() {
     let spent = br#"{"error":"invalid_token","message":"spent"}"#;
     let taken = br#"{"error":"name_taken","message":"held"}"#;
-    let cases: [(u16, &[u8], &str); 7] = [
+    let deleted = br#"{"error":"name_deleted","message":"deleted"}"#;
+    let cases: [(u16, &[u8], &str); 8] = [
         (401, spent, "rejected"),
         (409, taken, "already enrolled"),
+        (409, deleted, "allowDeletedName"),
         (500, b"", "may be spent"),
         (503, b"", "may be spent"),
         (400, b"{}", "refused"),

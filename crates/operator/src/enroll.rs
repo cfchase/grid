@@ -37,7 +37,8 @@ const MANAGED_BY: &str = "grid-operator";
 const SITE_LABEL: &str = "grid.praxis.fast/site";
 
 /// Recovery hint for a spent token.
-const SPENT: &str = "Delete the site's enrollment on the hub, then mint a new invite.";
+const SPENT: &str = "Delete the site's enrollment on the hub with enrollment-admin, then mint a new invite with \
+     allowDeletedName as a grid-admin that also holds enrollment-admin.";
 
 /// Auto-enroll configuration.
 #[derive(Args, Debug, Clone)]
@@ -107,6 +108,13 @@ pub enum EnrollError {
     /// The site name is already enrolled.
     #[error("site name already enrolled ({0}). {SPENT}")]
     NameTaken(String),
+
+    /// The site name's enrollment was deleted and the token does not re-admit it.
+    #[error(
+        "site name was deleted ({0}). The token is spent. Mint a new invite with allowDeletedName as a grid-admin \
+         that also holds enrollment-admin."
+    )]
+    NameDeleted(String),
 
     /// The service rejected the request.
     #[error("enrollment refused: {0}")]
@@ -656,7 +664,11 @@ fn classify(status: StatusCode, body: &[u8]) -> Result<Enrollment, EnrollError> 
     );
     Err(match status {
         StatusCode::UNAUTHORIZED => EnrollError::TokenRejected(detail),
-        StatusCode::CONFLICT if error.is_some_and(|err| err.error == "name_taken") => EnrollError::NameTaken(detail),
+        StatusCode::CONFLICT => match error.as_ref().map(|err| err.error.as_str()) {
+            Some("name_taken") => EnrollError::NameTaken(detail),
+            Some("name_deleted") => EnrollError::NameDeleted(detail),
+            _ => EnrollError::Refused(detail),
+        },
         _ if status.is_server_error() => EnrollError::MaybeSpent(detail),
         _ => EnrollError::Refused(detail),
     })
