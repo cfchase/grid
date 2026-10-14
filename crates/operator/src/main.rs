@@ -246,6 +246,7 @@ async fn main() {
                     published: Published {
                         site: ctx.signals(),
                         peers: ctx.peers(),
+                        feedback: operator::gateway_ages::GatewayFeedback::new(client.clone(), shutdown.clone()),
                     },
                     peer_identities: ctx.peer_identities(),
                     trust,
@@ -1412,6 +1413,8 @@ struct SignalsIdentity {
 /// Everything this operator publishes on the signals path.
 #[derive(Clone)]
 struct Published {
+    /// Independently persisted gateway diagnostic evidence.
+    feedback: operator::gateway_ages::GatewayFeedback,
     /// This site's own signals.
     site: operator::signals::SignalStore,
     /// What peers reported about themselves.
@@ -1452,9 +1455,7 @@ async fn run_signals_server(
     let advertised = swim_settled(swim)
         .await
         .and_then(|handle| handle.signals_address().map(str::to_owned));
-    let app = axum::Router::new()
-        .route(operator::signals::SIGNALS_PATH, axum::routing::get(signals_handler))
-        .with_state(listener.published.clone());
+    let app = signals_app(listener.published.clone());
 
     // The opt-in listener rebinds on every material change, so a transient
     // bind blip (a socket in TIME_WAIT across a rebind) must not be fatal to
@@ -2137,6 +2138,23 @@ impl<Stream: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for WriteDeadl
     }
 }
 
+/// Signals and feedback routes sharing the certificate-derived caller scope.
+fn signals_app(published: Published) -> axum::Router {
+    axum::Router::new()
+        .route(operator::signals::SIGNALS_PATH, axum::routing::get(signals_handler))
+        .route(grid_signals::feedback::INGEST_PATH, axum::routing::post(ingest_handler))
+        .with_state(published)
+}
+
+/// Accept completed ingests only from the certificate-proven local gateway.
+async fn ingest_handler(
+    axum::extract::State(published): axum::extract::State<Published>,
+    axum::Extension(caller): axum::Extension<Caller>,
+    request: axum::extract::Request,
+) -> axum::response::Response {
+    published.feedback.respond(caller == Caller::Local, request).await
+}
+
 /// Serve the coarse rollup, following the multi-target exporter pattern.
 ///
 /// `target` names one provider, `collect[]` names the signals wanted. Scope
@@ -2714,6 +2732,34 @@ async fn peer_tls(client: &Client) -> Option<Arc<operator::signals::PeerTlsMater
 #[allow(clippy::expect_used, reason = "tests")]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn feedback_handler_refuses_every_peer_scope() {
+        let client = Client::new(
+            tower::service_fn(|_request: http::Request<kube::client::Body>| async {
+                std::future::pending::<Result<http::Response<axum::body::Body>, std::convert::Infallible>>().await
+            }),
+            "default",
+        );
+        let published = Published {
+            site: operator::signals::SignalStore::new(),
+            peers: operator::signals::SignalStore::new(),
+            feedback: operator::gateway_ages::GatewayFeedback::new(client, operator::shutdown::Shutdown::never()),
+        };
+        for caller in [Caller::Peer(None), Caller::Peer(Some(BTreeMap::new()))] {
+            let response = ingest_handler(
+                axum::extract::State(published.clone()),
+                axum::Extension(caller),
+                http::Request::new(axum::body::Body::empty()),
+            )
+            .await;
+            assert_eq!(
+                response.status(),
+                http::StatusCode::FORBIDDEN,
+                "neither authorized peers nor absent identities can publish gateway status"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn peer_age_observation_waits_for_membership_release() {
@@ -4123,9 +4169,11 @@ mod tests {
 
     #[tokio::test]
     async fn a_relayed_row_reads_its_own_age_against_the_response_date() {
+        let client = stalled_peer_ages_client(false, Arc::new(std::sync::atomic::AtomicUsize::new(0)));
         let published = Published {
             site: operator::signals::SignalStore::new(),
             peers: operator::signals::SignalStore::new(),
+            feedback: operator::gateway_ages::GatewayFeedback::new(client, operator::shutdown::Shutdown::never()),
         };
         published.peers.refresh(
             BTreeMap::from([("east".to_owned(), vec![row_aged(std::time::Duration::from_secs(30))])]),
@@ -4216,5 +4264,273 @@ mod tests {
             }
         });
         Client::new(service, "default")
+    }
+
+    /// Real Kubernetes and mutual-TLS feedback proof for the isolated CI cluster.
+    #[cfg(not(feature = "fips"))]
+    mod feedback_contract {
+        use super::*;
+
+        /// Object owned only by this isolated contract test.
+        const NETWORK: &str = "gateway-feedback-contract";
+
+        #[tokio::test]
+        #[ignore = "requires the dedicated pre-install hub Kind cluster and checked-in CRD"]
+        async fn tls_feedback_persists_against_real_kubernetes() {
+            let client = real_client().await;
+            let api: Api<GridNetwork> = Api::all(client.clone());
+            initialize(&api).await;
+            reject_invalid_schema(&api).await;
+            let writes = Arc::new(Writes::default());
+            let feedback_client = racing_client(client, Arc::clone(&writes));
+            let feedback =
+                operator::gateway_ages::GatewayFeedback::new(feedback_client, operator::shutdown::Shutdown::never());
+            let mesh = Mesh::new();
+            peer_is_forbidden(&mesh, feedback.clone(), &writes).await;
+            local_is_acknowledged(&mesh, feedback).await;
+            verify_writes(&writes);
+            verify_evidence(&api).await;
+            api.delete(NETWORK, &kube::api::DeleteParams::default())
+                .await
+                .expect("remove the test network");
+        }
+
+        // ---------------------------------------------------------------------------
+        // Test Utilities
+        // ---------------------------------------------------------------------------
+
+        /// Observed requests and actual API-server conflicts.
+        #[derive(Default)]
+        struct Writes {
+            /// Real API-server responses carrying HTTP 409.
+            conflicts: std::sync::atomic::AtomicUsize,
+            /// Forwarded status patches, including the retry.
+            patches: std::sync::atomic::AtomicUsize,
+        }
+
+        /// A real peer certificate must never cause a gateway status write.
+        async fn peer_is_forbidden(mesh: &Mesh, feedback: operator::gateway_ages::GatewayFeedback, writes: &Writes) {
+            let peer = post(mesh, mesh.west_is_pinned(), feedback).await;
+            assert!(
+                peer.starts_with("HTTP/1.1 403"),
+                "a real peer certificate cannot ingest: {peer}"
+            );
+            assert_eq!(
+                writes.patches.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "peer makes no status write"
+            );
+        }
+
+        /// Only the local certificate earns an exact durable receipt.
+        async fn local_is_acknowledged(mesh: &Mesh, feedback: operator::gateway_ages::GatewayFeedback) {
+            let local = post(mesh, mesh.west_is_local(), feedback).await;
+            assert!(
+                local.starts_with("HTTP/1.1 204"),
+                "the real local certificate is acknowledged: {local}"
+            );
+            let headers = local.to_ascii_lowercase();
+            assert!(
+                headers.contains("x-grid-ingest-epoch: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n"),
+                "durable acknowledgment identifies the exact epoch"
+            );
+            assert!(
+                headers.contains("x-grid-ingest-sequence: 1\r\n"),
+                "durable acknowledgment identifies the exact sequence"
+            );
+        }
+
+        /// One actual stale-version rejection is followed by one fresh retry.
+        fn verify_writes(writes: &Writes) {
+            assert_eq!(
+                writes.conflicts.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "the API server really rejected a stale version"
+            );
+            assert_eq!(
+                writes.patches.load(std::sync::atomic::Ordering::SeqCst),
+                2,
+                "one stale patch then one fresh retry"
+            );
+        }
+
+        /// Use only the explicit isolated cluster supplied by the CI harness.
+        async fn real_client() -> Client {
+            let context = std::env::var("GRID_FEEDBACK_TEST_CONTEXT").expect("explicit isolated Kind context");
+            let options = kube::config::KubeConfigOptions {
+                context: Some(context),
+                ..Default::default()
+            };
+            let config = kube::Config::from_kubeconfig(&options)
+                .await
+                .expect("isolated cluster credentials");
+            Client::try_from(config).expect("real Kubernetes client")
+        }
+
+        /// Create one network and independently publish the peer's condition.
+        async fn initialize(api: &Api<GridNetwork>) {
+            let before = api
+                .list(&kube::api::ListParams::default())
+                .await
+                .expect("list isolated cluster");
+            assert!(
+                before.items.is_empty(),
+                "the contract test must not touch existing networks"
+            );
+            let network = serde_json::from_value(serde_json::json!({"apiVersion":"grid.praxis.fast/v1alpha1","kind":"GridNetwork","metadata":{"name":NETWORK},"spec":{"seeds":[],"gridId":"feedback-test"}})).expect("network fixture");
+            api.create(&PostParams::default(), &network)
+                .await
+                .expect("create network through real CRD");
+            let peer = serde_json::json!({
+                "apiVersion":"grid.praxis.fast/v1alpha1", "kind":"GridNetwork", "metadata":{"name":NETWORK},
+                "status":{"conditions":[{"type":"PeerTimeValid","status":"False","reason":"TimestampOutOfRange","message":"peer rejection must survive gateway evidence","lastTransitionTime":"2026-10-14T00:00:00Z"}]}
+            });
+            api.patch_status(
+                NETWORK,
+                &PatchParams::apply(operator::peer_ages::FIELD_MANAGER),
+                &Patch::Apply(&peer),
+            )
+            .await
+            .expect("peer field manager");
+        }
+
+        /// An integer bound in the checked-in CRD must reject invalid status.
+        async fn reject_invalid_schema(api: &Api<GridNetwork>) {
+            let invalid = serde_json::json!({"status":{"gatewayAgeReports":[{"epoch":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","replica":"gateway","sequence":0,"skew":0,"rejected":false,"reportedRejected":false,"receivedAt":"2026-10-14T00:00:00Z"}]}});
+            let result = api
+                .patch_status(NETWORK, &PatchParams::default(), &Patch::Merge(&invalid))
+                .await;
+            assert!(
+                matches!(&result, Err(kube::Error::Api(error)) if error.code == 422),
+                "the API server enforces sequence minimum one: {result:?}"
+            );
+        }
+
+        /// Forward every request to the real API after one competing metadata write.
+        fn racing_client(client: Client, writes: Arc<Writes>) -> Client {
+            let service = tower::service_fn(move |request: http::Request<kube::client::Body>| {
+                let (client, writes) = (client.clone(), Arc::clone(&writes));
+                async move {
+                    if request.method() == http::Method::PATCH
+                        && request.uri().path().ends_with("/status")
+                        && writes.patches.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0
+                    {
+                        let api: Api<GridNetwork> = Api::all(client.clone());
+                        let competing = serde_json::json!({"metadata":{"annotations":{"feedback-contract-race":"1"}}});
+                        api.patch_metadata(NETWORK, &PatchParams::default(), &Patch::Merge(&competing))
+                            .await?;
+                    }
+                    let response = client.send(request).await?;
+                    if response.status() == http::StatusCode::CONFLICT {
+                        writes.conflicts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    Ok::<_, kube::Error>(response)
+                }
+            });
+            Client::new(service, "default")
+        }
+
+        /// Post the wire contract through the same router and TLS classification as production.
+        async fn post(
+            mesh: &Mesh,
+            identity: SignalsIdentity,
+            feedback: operator::gateway_ages::GatewayFeedback,
+        ) -> String {
+            use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+            let (sources, peers) = (SourceSlots::new(1, 1), PeerSlots::new(1, 8));
+            let (addr, server) = mesh
+                .serve(identity, feedback_app(feedback), (&sources, &peers), 1)
+                .await;
+            let mut stream = mesh.connect(addr).await;
+            stream.write_all(wire_report().as_bytes()).await.expect("real TLS POST");
+            let mut answer = Vec::new();
+            tokio::time::timeout(std::time::Duration::from_secs(10), stream.read_to_end(&mut answer))
+                .await
+                .expect("bounded response")
+                .expect("read response");
+            server.await.expect("TLS server finished");
+            String::from_utf8(answer).expect("HTTP response")
+        }
+
+        /// The exact production router with the real status client under test.
+        fn feedback_app(feedback: operator::gateway_ages::GatewayFeedback) -> axum::Router {
+            signals_app(Published {
+                site: operator::signals::SignalStore::new(),
+                peers: operator::signals::SignalStore::new(),
+                feedback,
+            })
+        }
+
+        /// One empty-body version-one observation on the production POST path.
+        fn wire_report() -> String {
+            format!(
+                "POST {} HTTP/1.1\r\nHost: east\r\nConnection: close\r\nContent-Length: 0\r\nx-grid-ingest-version: 1\r\nx-grid-ingest-replica: gateway\r\nx-grid-ingest-epoch: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\nx-grid-ingest-sequence: 1\r\nx-grid-ingest-skew: 1\r\nx-grid-ingest-rejected: true\r\n\r\n",
+                grid_signals::feedback::INGEST_PATH
+            )
+        }
+
+        /// Both durable evidence and each writer's real SSA ownership survive the retry.
+        async fn verify_evidence(api: &Api<GridNetwork>) {
+            let network = api.get(NETWORK).await.expect("durable evidence");
+            verify_conditions(network.status.as_ref().expect("status persisted"));
+            let fields = serde_json::to_value(&network.metadata.managed_fields).expect("managed fields");
+            verify_owner(
+                &fields,
+                operator::peer_ages::FIELD_MANAGER,
+                "PeerTimeValid",
+                "GatewayAgesRejected",
+            );
+            verify_owner(
+                &fields,
+                operator::gateway_ages::FIELD_MANAGER,
+                "GatewayAgesRejected",
+                "PeerTimeValid",
+            );
+        }
+
+        /// A gateway's fresh rejection does not recover the independently rejected peer.
+        fn verify_conditions(status: &operator::crd::grid_network::GridNetworkStatus) {
+            let peer = status
+                .conditions
+                .iter()
+                .find(|held| held.type_ == "PeerTimeValid")
+                .expect("peer condition preserved");
+            assert_eq!(peer.status, "False", "gateway publication cannot recover the peer");
+            assert_eq!(peer.reason, "TimestampOutOfRange", "peer reason preserved");
+            let gateway = status
+                .conditions
+                .iter()
+                .find(|held| held.type_ == "GatewayAgesRejected")
+                .expect("gateway condition persisted");
+            assert_eq!(gateway.status, "True", "fresh gateway rejection persisted");
+            assert_eq!(status.gateway_age_reports.len(), 1, "one durable reporter");
+            assert!(
+                status
+                    .gateway_age_reports
+                    .first()
+                    .is_some_and(|report| report.sequence == 1 && report.rejected),
+                "exact accepted gateway evidence"
+            );
+        }
+
+        /// A real field manager owns its keyed condition without claiming the other's key.
+        fn verify_owner(fields: &serde_json::Value, manager: &str, own: &str, other: &str) {
+            let owner = fields
+                .as_array()
+                .expect("field managers")
+                .iter()
+                .find(|entry| entry.get("manager").and_then(serde_json::Value::as_str) == Some(manager))
+                .expect("independent manager");
+            let conditions = owner
+                .pointer("/fieldsV1/f:status/f:conditions")
+                .expect("owned condition fields");
+            let own_key = format!("k:{{\"type\":\"{own}\"}}");
+            let other_key = format!("k:{{\"type\":\"{other}\"}}");
+            assert!(conditions.get(&own_key).is_some(), "{manager} owns its keyed condition");
+            assert!(
+                conditions.get(&other_key).is_none(),
+                "{manager} cannot own the other condition"
+            );
+        }
     }
 }

@@ -5130,14 +5130,14 @@ async fn update_status(
 ) -> Result<(), OperatorError> {
     let name = grid_network_name(network)?;
 
-    let connected_sites = membership.map_or(0, MembershipSnapshot::connected_count);
-
     let api: Api<GridNetwork> = Api::all(client.clone());
     let status = GridNetworkStatus {
-        // The peer poller owns the conditions under its own field manager. Left
-        // empty, they are not serialized, so this apply never claims or clears them.
+        // Signal publishers own this evidence under separate field managers. Left
+        // empty, it is not serialized, so this apply never claims or clears it.
         conditions: Vec::new(),
-        connected_sites,
+        gateway_age_reports: Vec::new(),
+        gateway_age_report_overflow: false,
+        connected_sites: membership.map_or(0, MembershipSnapshot::connected_count),
         distributed_provider_count,
         grid_id: grid_id.to_owned(),
         observed_generation: network.metadata.generation.unwrap_or(0),
@@ -5243,13 +5243,15 @@ fn identity_status(cert_pem: &str, now: time::OffsetDateTime, renews: bool) -> O
     })
 }
 
-/// Return whether the status subresource differs from the desired status, apart
-/// from `conditions`, which the peer poller writes and this reconcile never does.
+/// Return whether reconciliation-owned status differs from the desired status.
+/// Ignore conditions and gateway evidence managed by the signal publishers.
 fn grid_network_status_needs_update(current: Option<&GridNetworkStatus>, desired: &GridNetworkStatus) -> bool {
     current.is_none_or(|current| {
         *desired
             != GridNetworkStatus {
                 conditions: desired.conditions.clone(),
+                gateway_age_reports: desired.gateway_age_reports.clone(),
+                gateway_age_report_overflow: desired.gateway_age_report_overflow,
                 ..current.clone()
             }
     })
@@ -7871,6 +7873,8 @@ mod tests {
     fn grid_network_status_update_is_skipped_when_semantically_unchanged() {
         let baseline = GridNetworkStatus {
             conditions: Vec::new(),
+            gateway_age_reports: Vec::new(),
+            gateway_age_report_overflow: false,
             connected_sites: 2,
             distributed_provider_count: 2,
             grid_id: "grid-id".to_owned(),
@@ -7890,6 +7894,40 @@ mod tests {
         };
         assert!(grid_network_status_needs_update(Some(&baseline), &changed));
         assert!(grid_network_status_needs_update(None, &baseline));
+    }
+
+    #[test]
+    fn independently_owned_evidence_is_omitted_and_does_not_trigger_reconcile() -> Result<(), serde_json::Error> {
+        let baseline = GridNetworkStatus::default();
+        let mut independently_owned = baseline.clone();
+        independently_owned.conditions = vec![crate::crd::inference_provider::Condition {
+            type_: crate::peer_ages::PEER_TIME_VALID.to_owned(),
+            status: "False".to_owned(),
+            reason: "TimestampOutOfRange".to_owned(),
+            ..Default::default()
+        }];
+        independently_owned.gateway_age_report_overflow = true;
+        independently_owned.gateway_age_reports = vec![crate::crd::grid_network::GatewayAgeReport {
+            replica: "gateway".to_owned(),
+            epoch: "a".repeat(32),
+            sequence: 1,
+            skew: 1,
+            rejected: true,
+            reported_rejected: true,
+            received_at: "t0".to_owned(),
+        }];
+        assert!(
+            !grid_network_status_needs_update(Some(&independently_owned), &baseline),
+            "separate evidence ownership cannot cause reconcile loops"
+        );
+        let serialized = serde_json::to_value(&baseline)?;
+        assert!(
+            serialized.get("conditions").is_none()
+                && serialized.get("gatewayAgeReports").is_none()
+                && serialized.get("gatewayAgeReportOverflow").is_none(),
+            "normal reconciliation never claims separately managed status"
+        );
+        Ok(())
     }
 
     #[test]

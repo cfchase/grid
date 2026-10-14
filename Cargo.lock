@@ -2510,6 +2510,7 @@ dependencies = [
  "crdt",
  "futures",
  "grid-client",
+ "grid-signals",
  "http",
  "http-body-util",
  "httpdate",
