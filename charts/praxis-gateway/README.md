@@ -302,7 +302,7 @@ Praxis AI image; these values may advance independently.
 | `mountReconciliation.managedCredentialNames` | list | `[]` | Credential Secret names to release from Helm in the second handoff phase. Other entries in `providerCredentials` remain Helm-managed. |
 | `mountReconciliation.rbac.create` | bool | `true` | Render a Role and RoleBinding in the release namespace that let the operator ServiceAccount `get` and `patch` this chart's Deployment and no other. `false` leaves the Role to you; see below. |
 | `mountReconciliation.operator.serviceAccount` | string | `grid-operator` | Operator ServiceAccount the Role binds. Blank fails the render while `rbac.create` is true. |
-| `mountReconciliation.operator.namespace` | string | `grid-system` | Namespace of that ServiceAccount. Blank fails the render while `rbac.create` is true. |
+| `mountReconciliation.operator.namespace` | string | required | Namespace of that ServiceAccount. Blank fails the render while `rbac.create` is true. |
 | `networkPolicy.enabled` | bool | `false` | Render a NetworkPolicy that limits which pods can reach the listener port, where the CNI enforces NetworkPolicy. It is not authentication. Node and host-network traffic handling is CNI-specific (OVN-Kubernetes: the `policy-group.network.openshift.io/host-network` label), and a LoadBalancer with `externalTrafficPolicy: Cluster` can SNAT clients to node IPs. |
 | `networkPolicy.from` | list | `[]` | NetworkPolicyPeer entries allowed in. Required when enabled. With `auth.mode: none`, list only the authenticating front. `{podSelector: {}}` admits every pod in this namespace. An empty `namespaceSelector` and an `ipBlock` of `0.0.0.0/0` or `::/0` admit everyone and fail the render. An all-address `ipBlock` with `except` entries is allowed. The check reads selector emptiness and the cidr only, so `matchExpressions` that happen to select every pod pass. A provider gateway behind a LoadBalancer that SNATs clients to node IPs needs `ipBlock` peers for those node addresses. |
 | `metricsListener.enabled` | bool or `auto` | `auto` | Serve `GET /metrics` over TLS on its own port and ClusterIP Service, for an in-cluster Prometheus. The admin listener refuses a non-loopback Host, so Prometheus cannot scrape it. Needs the grid-gateway image, `existingSecret`, `fromNamespaces`, and `networkPolicy.enabled`. The port answers only `/metrics` but has no authentication, so the NetworkPolicy is its access control, and that holds only where the CNI enforces NetworkPolicy. `auto` serves it for the grid-gateway image on OpenShift with `networkPolicy.enabled`, and fills each unset value from the platform: `existingSecret` is `<fullname>-metrics-tls`, requested from the service serving signer by an annotation on the metrics Service, `fromNamespaces` is `openshift-user-workload-monitoring`, and `serviceMonitor.caConfigMap` is `openshift-service-ca.crt`, key `service-ca.crt`. Elsewhere `auto` is off, since no cert source exists by default. On OpenShift without the NetworkPolicy it stays off and the install notes say so. |
@@ -506,9 +506,11 @@ The operator's own charts grant no unrestricted Deployment access; certificate
 rotation retains a grant on the named gateway Deployment. With
 `mountReconciliation.enabled`, this chart renders a Role and RoleBinding in
 the release namespace that let `mountReconciliation.operator.serviceAccount`
-in `mountReconciliation.operator.namespace` (`grid-operator` in `grid-system`
-by default) `get` and `patch` this chart's Deployment and no other. The Role
-names the Deployment with the same helper as the Deployment itself, so
+in `mountReconciliation.operator.namespace` `get` and `patch` this chart's
+Deployment and no other. The account name defaults to `grid-operator`; its
+namespace has none, because a Helm install and a platform install put the
+operator in different ones. The Role names the Deployment with the same helper
+as the Deployment itself, so
 `fullnameOverride` moves both. Set `mountReconciliation.rbac.create: false`
 to bring your own Role, for example from an installer that may not create
 RBAC; the Role to create, and what the grant still allows (`patch` is
@@ -526,7 +528,10 @@ after the `GridNetwork` stops delegating.
 
 Upgrading from v0.2.0 with delegation enabled: the v0.2.0 operator charts
 granted every Deployment in their resource namespaces, and that rule is
-gone. Upgrade this chart first, so the Role exists, then the operator. Out
+gone. Upgrade this chart first, so the Role exists, then the operator. Set
+`mountReconciliation.operator.namespace` on that upgrade: it no longer
+defaults, so a release that left it unset fails to render until it names the
+namespace the operator runs in. Out
 of order, the operator reports
 `mountReconciliationStatus[].reason: DeploymentForbidden`, patches nothing,
 retains the previous populated routing overlay, and cannot publish new
@@ -549,6 +554,8 @@ mountReconciliation:
   gatewayRef: consumer-gateway
   managedCredentialNames: [backend-api-token]
   releaseHelmMounts: false
+  operator:
+    namespace: grid-system # the operator's namespace, which has no default
 providerCredentials:
   - secretName: backend-api-token
     mountPath: /run/secrets/backend-api-token # retained during preparation
