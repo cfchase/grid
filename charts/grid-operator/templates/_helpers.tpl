@@ -163,11 +163,18 @@ Service. Without enrollment nothing changes.
 {{- end }}
 {{- if not $v.gateway.serviceName }}{{- $_ := set $v.gateway "serviceName" "grid-gateway" }}{{- end }}
 {{- end }}
+{{- /* A hub names its in-cluster signer whether or not it enrolls through it: a hub whose
+     identity bootstrap issued still renews there. */}}
+{{- if or $e.enabled $e.hub }}
+{{- if not $v.rbac.enrollmentNamespace }}{{- $_ := set $v.rbac "enrollmentNamespace" "grid-enrollment" }}{{- end }}
+{{- end }}
+{{- if and $e.hub (not $e.url) }}
+{{- $_ := set $e "url" (printf "https://%s.%s.svc:%v" ($e.hubService | default "grid-enrollment") $v.rbac.enrollmentNamespace ($e.hubPort | default 8443)) }}
+{{- end }}
 {{- if $e.enabled }}
 {{- if not $e.siteName }}{{- $_ := set $e "siteName" $v.swim.siteName }}{{- end }}
 {{- if not $v.swim.siteName }}{{- $_ := set $v.swim "siteName" $e.siteName }}{{- end }}
-{{- if not $v.rbac.enrollmentNamespace }}{{- $_ := set $v.rbac "enrollmentNamespace" "grid-enrollment" }}{{- end }}
-{{- if not $e.url }}{{- $_ := set $e "url" (printf "https://grid-enrollment.%s.svc:8443" $v.rbac.enrollmentNamespace) }}{{- end }}
+{{- if not $e.url }}{{- fail "enrollment.url is required: name the hub's signer, or set enrollment.hub=true where grid-enrollment runs on this cluster" }}{{- end }}
 {{- if not $v.gateway.serviceName }}{{- $_ := set $v.gateway "serviceName" "grid-gateway" }}{{- end }}
 {{- if kindIs "invalid" $svc.enabled }}{{- $_ := set $svc "enabled" true }}{{- if not $svc.type }}{{- $_ := set $svc "type" "LoadBalancer" }}{{- end }}{{- end }}
 {{- end }}

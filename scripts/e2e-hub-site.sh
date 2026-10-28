@@ -339,6 +339,17 @@ leaf_digest() {
 
 enrolled() { k "$1" get secret grid-site-identity grid-ca; }
 
+# network_condition <context> <type>: status/reason of one GridNetwork condition. This
+# site's own conditions live there; its GridSite carries membership only.
+network_condition() {
+  kubectl --context "$1" get gridnetwork grid \
+    -o jsonpath="{.status.conditions[?(@.type==\"$2\")].status}/{.status.conditions[?(@.type==\"$2\")].reason}"
+}
+
+# site_reports_enrolled <context>: the signer issued this site's identity, so a Secret some
+# other writer left cannot pass as enrolled.
+site_reports_enrolled() { [[ $(network_condition "$1" Enrolled) == True/Enrolled ]]; }
+
 # snapshot_logs <context> <label>: every container, init and hook pods included.
 # Returns nonzero when any listing or log fetch fails.
 snapshot_logs() {
@@ -433,9 +444,11 @@ install_hub() {
   ha_operator_args
   helm_on "$HUB_CTX" "$NS" grid-operator grid-operator "${RA[@]}" "${OA[@]}" \
     --set swim.siteName=hub --set enrollment.enabled=true --set grid.peerTrust="$MODE" \
+    --set "enrollment.url=https://grid-enrollment.$ENS.svc:$ENROLL_PORT" \
     "${IMG[@]}" --set swim.service.loadBalancerIP="$HUB_SWIM_IP" \
     --set signals.service.loadBalancerIP="$HUB_SIG_IP" || die "install hub grid-operator"
   copy_key "$HUB_CTX" "$ENS" "$HUB_CTX" grid-ca-bundle ca.crt || die "copy the hub CA bundle"
+  k "$HUB_CTX" label secret grid-ca-bundle grid.praxis.fast/signer-bundle=true >/dev/null || die "opt the hub CA bundle in"
   copy_key "$HUB_CTX" "$ENS" "$HUB_CTX" grid-invite-hub token hub || die "copy the hub invite"
   head -c 32 /dev/urandom | k "$HUB_CTX" create secret generic grid-swim-key --from-file=key=/dev/stdin >/dev/null \
     || die "create grid-swim-key"
@@ -466,6 +479,8 @@ install_hub() {
   fi
   eventually "hub operator enrolled from its own invite through the in-cluster Service" enrolled "$HUB_CTX" \
     || die "hub not enrolled"
+  eventually "hub GridNetwork reports Enrolled by the signer" site_reports_enrolled "$HUB_CTX" \
+    || die "hub identity not issued by the signer"
   HUB_DIGEST=$(leaf_digest "$HUB_CTX")
   [[ $HUB_DIGEST =~ ^[0-9a-f]{64}$ ]] || die "no hub leaf digest"
   snapshot_logs "$HUB_CTX" hub || true
@@ -506,12 +521,14 @@ install_site() {
   renewal_args grid-operator
   helm_on "$SITE_CTX" "$NS" grid-operator grid-operator "${RA[@]}" \
     --set "swim.siteName=$SITE" --set "swim.seeds=$HUB_SWIM_IP:7946" \
-    --set enrollment.enabled=true --set "enrollment.url=https://grid-enrollment.$ENS.svc:$ENROLL_PORT" \
+    --set enrollment.enabled=true \
+    --set "enrollment.url=https://grid-enrollment.$ENS.svc:$ENROLL_PORT" \
     --set grid.peerTrust="$MODE" \
     "${IMG[@]}" --set swim.service.loadBalancerIP="$SITE_SWIM_IP" \
     --set signals.service.loadBalancerIP="$SITE_SIG_IP" || die "install site grid-operator"
   enrollment_forward || die "enrollment forward"
   copy_key "$HUB_CTX" "$ENS" "$SITE_CTX" grid-ca-bundle ca.crt || die "copy the site CA bundle"
+  k "$SITE_CTX" label secret grid-ca-bundle grid.praxis.fast/signer-bundle=true >/dev/null || die "opt the site CA bundle in"
   copy_key "$HUB_CTX" "$ENS" "$SITE_CTX" "grid-invite-$SITE" token "$SITE" || die "copy the site invite"
   copy_key "$HUB_CTX" "$NS" "$SITE_CTX" grid-swim-key key || die "copy the SWIM key"
   if [[ $(k "$SITE_CTX" get secret "grid-invite-$SITE" -o jsonpath='{.metadata.labels.grid\.praxis\.fast/site}') == "$SITE" ]]; then
@@ -535,6 +552,8 @@ install_site() {
     "${IMG[@]}" --set service.loadBalancerIP="$SITE_GW_IP" || die "install site grid-gateway"
   eventually "site operator enrolled from its copied invite through the hub enrollment URL" enrolled "$SITE_CTX" \
     || die "site not enrolled"
+  eventually "$SITE GridNetwork reports Enrolled by the signer" site_reports_enrolled "$SITE_CTX" \
+    || die "$SITE identity not issued by the signer"
   # Every later hub grid-site upgrade carries the site's digest: helm does not reuse the release's values.
   HUB_SITE_ARGS+=(--set "peers.$SITE.digest=$(leaf_digest "$SITE_CTX")")
   helm_on "$HUB_CTX" "$NS" grid-site grid-site "${HUB_SITE_ARGS[@]}" "${SR[@]}" || die "pin the site on the hub"
@@ -813,9 +832,12 @@ assert_health() {
     restarts=$(kubectl --context "$ctx" get pods -A -o json | jq -r --arg a "$NS" --arg b "$ENS" '.items[]
       | select(.metadata.namespace == $a or .metadata.namespace == $b) | .metadata.name as $p
       | ((.status.initContainerStatuses // []) + (.status.containerStatuses // []))[]
-      | select(.restartCount > 0) | "\($p)/\(.name)=\(.restartCount)"')
+      | select(.restartCount > 0)
+      # Enrolling while it waits for an identity, the operator exits 0 once to restart under it.
+      | select((.name == "operator" and .restartCount == 1 and .lastState.terminated.exitCode == 0) | not)
+      | "\($p)/\(.name)=\(.restartCount)"')
     if [[ -z $restarts ]]; then
-      pass "$ctx: zero container restarts in $NS and $ENS"
+      pass "$ctx: no container restarts in $NS and $ENS beyond the operator's one clean restart onto its identity"
     else
       fail "$ctx: container restarts: $(tr '\n' ' ' <<<"$restarts")"
     fi
@@ -1749,8 +1771,9 @@ watch_hub_path() {
   # renewal, so allow a pod swap: Service traffic stays up, this tunnel does not.
   site_route && tries=8
   # stop_monitors kills this subshell; take its port-forward with it.
-  trap '[[ -z $pf ]] || kill "$pf" 2>/dev/null; exit 0' TERM
-  trap '[[ -z $pf ]] || kill "$pf" 2>/dev/null' EXIT
+  # The EXIT trap runs after the function's locals are gone, so read pf defensively.
+  trap '[[ -z ${pf:-} ]] || kill "$pf" 2>/dev/null; exit 0' TERM
+  trap '[[ -z ${pf:-} ]] || kill "$pf" 2>/dev/null' EXIT
   while :; do
     for ((try = 1; try <= tries; try++)); do
       if [[ -z $pf ]] || ! kill -0 "$pf" 2>/dev/null; then
@@ -2041,22 +2064,37 @@ assert_renewal() {
   pass "re-enrolled $SITE renews again"
 }
 
-# Pin trust does not renew: the operator says so once and schedules no renewal.
-assert_pin_no_renewal() {
-  local ctx logs
-  [[ $MODE == pin ]] || return 0
+# rotation_reads <context> <status/reason>: the GridNetwork's RotationOnSchedule.
+rotation_reads() { [[ $(network_condition "$1" RotationOnSchedule) == "$2" ]]; }
+
+# accepted_reads <context> <status/reason>: the GridNetwork's Accepted.
+accepted_reads() { [[ $(network_condition "$1" Accepted) == "$2" ]]; }
+
+# Rotation is declared where the config is generated, never derived at runtime: the chart
+# wrote site.signerEndpoint.rotation Disabled under pin into the operator config, and left it
+# out under spiffe for the operator's default, Enabled. The GridNetwork's conditions follow:
+# RotationOnSchedule reads True either way, and only its message says whether a signer
+# renews or nothing does, so the assertion stops at status and reason. Under pin that
+# True also says no renewal is scheduled, which status.identity.rotateAfter used to say.
+assert_rotation_declared() {
+  local ctx declared want
   for ctx in "$HUB_CTX" "$SITE_CTX"; do
-    # Captured first: grep -q exits at its match, and pipefail would report the writer's SIGPIPE.
-    logs=$(operator_logs "$ctx" | strip_ansi)
-    if grep -q 'rotation disabled: peerTrust pin' <<<"$logs"; then
-      pass "$ctx: operator logged that pin trust disables renewal"
+    declared=$(k "$ctx" get configmap grid-operator-config -o jsonpath='{.data.config\.yaml}' \
+      | sed -n 's/^ *rotation: "\{0,1\}\([A-Za-z]*\)"\{0,1\}$/\1/p')
+    want=""
+    [[ $MODE == pin ]] && want=Disabled
+    if [[ $declared == "$want" ]]; then
+      pass "$ctx: the operator config declares site.signerEndpoint.rotation '${declared:-default Enabled}'"
     else
-      fail "$ctx: no rotation disabled line under pin trust"
+      fail "$ctx: the operator config declares site.signerEndpoint.rotation '$declared', want '$want'"
     fi
-    if [[ -z $(k "$ctx" get gridnetwork grid -o jsonpath='{.status.identity.rotateAfter}') ]]; then
-      pass "$ctx: status.identity.rotateAfter is empty under pin trust"
+    if [[ $MODE == pin ]]; then
+      eventually "$ctx: GridNetwork reports RotationOnSchedule True with rotation Disabled under pin" \
+        rotation_reads "$ctx" True/RotationOnSchedule || true
+      eventually "$ctx: GridNetwork is Accepted with rotation Disabled under pin" accepted_reads "$ctx" True/Accepted || true
     else
-      fail "$ctx: status.identity.rotateAfter set under pin trust"
+      eventually "$ctx: GridNetwork reports RotationOnSchedule True through site.signerEndpoint" \
+        rotation_reads "$ctx" True/RotationOnSchedule || true
     fi
   done
 }
@@ -2096,7 +2134,7 @@ cmd_test() {
     assert_serving
     assert_ha
     assert_site_route
-    assert_pin_no_renewal
+    assert_rotation_declared
     assert_renewal
     assert_health
   done
