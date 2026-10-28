@@ -10,7 +10,28 @@ FAIL=0
 KIND_CLUSTER=""
 
 OPERATOR_IMAGE="ghcr.io/praxis-proxy/grid-operator"
-OPERATOR_TAG="${GRID_OPERATOR_CI_TAG:-v0.1.5}"
+ENROLLMENT_IMAGE="ghcr.io/praxis-proxy/grid-enrollment"
+# GRID_IMAGE_TAG: the tag of images built from this checkout, for every chart the kind path
+# installs. Empty leaves the charts' own default, which is the published image for their
+# appVersion: that tests the last release rather than this code, and on a release branch the
+# tag does not exist yet, so every pod waits on a pull that cannot succeed. An image this
+# names must be built here; a missing one fails rather than falling back to the published one.
+GRID_IMAGE_TAG="${GRID_IMAGE_TAG:-}"
+# GRID_OPERATOR_CI_TAG: the older knob, which names an operator tag and nothing else. It says
+# nothing about any other chart, so it never implies an enrollment image, and its tag may be
+# a registry one, so it never requires a local build.
+OPERATOR_TAG="${GRID_IMAGE_TAG:-${GRID_OPERATOR_CI_TAG:-v0.1.5}}"
+OPERATOR_PINNED=""
+if [ -n "$GRID_IMAGE_TAG" ] || [ -n "${GRID_OPERATOR_CI_TAG:-}" ]; then
+  OPERATOR_PINNED=1
+fi
+# An enrollment image named outright is used as given and may be a registry image. One
+# derived from GRID_IMAGE_TAG is built here.
+ENROLL_IMAGE_NAMED=""
+if [ -n "${ENROLL_IMAGE_REF:-}" ]; then
+  ENROLL_IMAGE_NAMED=1
+fi
+ENROLL_IMAGE_REF="${ENROLL_IMAGE_REF:-${GRID_IMAGE_TAG:+${ENROLLMENT_IMAGE}:${GRID_IMAGE_TAG}}}"
 DEFAULT_GATEWAY_IMAGE="ghcr.io/praxis-proxy/ai:0.7.0"
 
 # Helpers
@@ -1319,14 +1340,80 @@ if [ "${KIND:-}" = "1" ] || [ "${1:-}" = "--kind" ]; then
     exit 1
   fi
 
-  # Load operator image if available
-  IMAGE_REF="${OPERATOR_IMAGE}:${OPERATOR_TAG}"
-  if command -v docker &>/dev/null && docker image inspect "$IMAGE_REF" &>/dev/null; then
-    kind load docker-image "$IMAGE_REF" --name "$KIND_CLUSTER" 2>/dev/null
-  elif command -v podman &>/dev/null && podman image exists "$IMAGE_REF" 2>/dev/null; then
-    podman save "$IMAGE_REF" -o "$WORK/grid-op-${KIND_CLUSTER}.tar" 2>/dev/null
-    kind load image-archive "$WORK/grid-op-${KIND_CLUSTER}.tar" --name "$KIND_CLUSTER" 2>/dev/null
-    rm -f "$WORK/grid-op-${KIND_CLUSTER}.tar"
+  # kind_load <ref>: put a locally built image in the cluster. 0 loaded, 1 not built here,
+  # 2 built but the load failed.
+  kind_load() {
+    local ref="$1" archive
+    if command -v docker &>/dev/null && docker image inspect "$ref" &>/dev/null; then
+      kind load docker-image "$ref" --name "$KIND_CLUSTER" >/dev/null 2>&1 || return 2
+    elif command -v podman &>/dev/null && podman image exists "$ref" 2>/dev/null; then
+      archive="$WORK/$(printf '%s' "$ref" | tr '/:' '--')-${KIND_CLUSTER}.tar"
+      if ! { podman save "$ref" -o "$archive" >/dev/null 2>&1 \
+        && kind load image-archive "$archive" --name "$KIND_CLUSTER" >/dev/null 2>&1; }; then
+        rm -f "$archive"
+        return 2
+      fi
+      rm -f "$archive"
+    else
+      return 1
+    fi
+    return 0
+  }
+
+  # in_cluster <ref> <required>: load <ref> when it is built here, and say whether the cluster
+  # now holds it, which is the only case where an install may pin pullPolicy=Never. A required
+  # image is one this run is meant to have built, so not finding it is a failure rather than a
+  # reason to let the cluster pull a published image that is not the code under test.
+  in_cluster() {
+    local ref="$1" required="$2" rc
+    kind_load "$ref"
+    rc=$?
+    case "$rc" in
+      0)
+        pass "kind: loaded $ref"
+        return 0
+        ;;
+      2)
+        fail "kind: could not load $ref"
+        return 1
+        ;;
+      *)
+        if [ -n "$required" ]; then
+          fail "kind: $ref is not built, so the charts would install a published image instead of this code"
+        else
+          pass "kind: $ref is not built here, so the cluster pulls it"
+        fi
+        return 1
+        ;;
+    esac
+  }
+
+  # Only a tag from GRID_IMAGE_TAG is required to be built here.
+  OPERATOR_LOCAL=""
+  if [ -n "$OPERATOR_PINNED" ] && in_cluster "${OPERATOR_IMAGE}:${OPERATOR_TAG}" "${GRID_IMAGE_TAG:+1}"; then
+    OPERATOR_LOCAL=1
+  fi
+  ENROLL_REQUIRED=""
+  if [ -n "$GRID_IMAGE_TAG" ] && [ -z "$ENROLL_IMAGE_NAMED" ]; then
+    ENROLL_REQUIRED=1
+  fi
+  ENROLL_LOCAL=""
+  if [ -n "$ENROLL_IMAGE_REF" ] && in_cluster "$ENROLL_IMAGE_REF" "$ENROLL_REQUIRED"; then
+    ENROLL_LOCAL=1
+  fi
+  ENROLL_IMAGE_ARGS=()
+  if [ -n "$ENROLL_IMAGE_REF" ]; then
+    ENROLL_IMAGE_ARGS=(
+      --set "image.repository=${ENROLL_IMAGE_REF%:*}"
+      --set "image.tag=${ENROLL_IMAGE_REF##*:}"
+    )
+    # Never only for an image the cluster already holds: a missing one then fails at once
+    # instead of waiting out a pull, which is the hang this guards. A registry image is left
+    # to the cluster's own policy, or it would never pull at all. The chart keeps the Postgres
+    # pullPolicy separate, so this reaches only the app image.
+    if [ -n "$ENROLL_LOCAL" ]; then
+      ENROLL_IMAGE_ARGS+=(--set image.pullPolicy=Never)
+    fi
   fi
 
   KCTX="kind-${KIND_CLUSTER}"
@@ -1340,10 +1427,13 @@ if [ "${KIND:-}" = "1" ] || [ "${1:-}" = "--kind" ]; then
     fail "kind: crds apply -k (server dry-run)"
   fi
 
-  # Build install args; use CI tag override when set
+  # Install the image loaded above rather than the chart's published default.
   OP_INSTALL_ARGS=()
-  if [ -n "${GRID_OPERATOR_CI_TAG:-}" ]; then
+  if [ -n "$OPERATOR_PINNED" ]; then
     OP_INSTALL_ARGS+=(--set "image.tag=${OPERATOR_TAG}")
+    if [ -n "$OPERATOR_LOCAL" ]; then
+      OP_INSTALL_ARGS+=(--set image.pullPolicy=Never)
+    fi
   fi
 
   # Grid operator lifecycle
@@ -1470,9 +1560,7 @@ CR_EOF
     --set "hubSite.namespace=$ENROLL_HUB_NS"
     --wait --timeout 5m
   )
-  if [ -n "${ENROLL_IMAGE_REF:-}" ]; then
-    ENROLL_ARGS+=(--set "image.repository=${ENROLL_IMAGE_REF%%:*}" --set "image.tag=${ENROLL_IMAGE_REF##*:}")
-  fi
+  ENROLL_ARGS+=(${ENROLL_IMAGE_ARGS[@]+"${ENROLL_IMAGE_ARGS[@]}"})
 
   if helm install grid-enrollment charts/grid-enrollment "${ENROLL_ARGS[@]}" 2>&1; then
     pass "kind: enrollment install"
@@ -1615,9 +1703,7 @@ GEN_EOF
   # succeed and the namespace has to be there afterwards. The old form of this check
   # asserted the opposite and counted any unrelated install failure as a pass.
   FRESH_ARGS=(--namespace enroll-fresh --create-namespace --kube-context "$KCTX" --wait --timeout 5m)
-  if [ -n "${ENROLL_IMAGE_REF:-}" ]; then
-    FRESH_ARGS+=(--set "image.repository=${ENROLL_IMAGE_REF%%:*}" --set "image.tag=${ENROLL_IMAGE_REF##*:}")
-  fi
+  FRESH_ARGS+=(${ENROLL_IMAGE_ARGS[@]+"${ENROLL_IMAGE_ARGS[@]}"})
   if helm install enroll-fresh charts/grid-enrollment "${FRESH_ARGS[@]}" >/dev/null 2>&1; then
     pass "kind: install creates its own invite namespace"
     if kubectl --context "$KCTX" get namespace enroll-fresh-invites >/dev/null 2>&1; then
@@ -2286,6 +2372,40 @@ for chart in charts/*/; do
 done
 
 echo ""
+echo "=== A chart's own images default to its appVersion ==="
+# Cheap and pull-free: the kind path installs images built from this checkout, so nothing
+# else notices when a chart's default tag stops following its appVersion. A release then
+# ships a chart whose default pulls some other version.
+# appversion_images <label> <chart> [helm template args...]
+appversion_images() {
+  local label="$1" chart="$2" want rendered found bad
+  shift 2
+  want=$(awk '/^appVersion:/{gsub(/"/, "", $2); print $2; exit}' "$chart/Chart.yaml")
+  if [ -z "$want" ]; then
+    fail "appVersion: $label declares none"
+    return
+  fi
+  if ! rendered=$(helm template v-appver "$chart" "$@" 2>&1); then
+    fail "appVersion: $label does not render"
+    return
+  fi
+  found=$(printf '%s\n' "$rendered" | grep -oE 'ghcr\.io/praxis-proxy/[^":[:space:]]+:[^":[:space:]]+' | sort -u)
+  if [ -z "$found" ]; then
+    fail "appVersion: $label renders no praxis-proxy image, so this check would prove nothing"
+    return
+  fi
+  bad=$(printf '%s\n' "$found" | grep -v ":${want}\$" || true)
+  if [ -z "$bad" ]; then
+    pass "appVersion: $label images default to $want"
+  else
+    fail "appVersion: $label images do not follow appVersion $want: $(printf '%s' "$bad" | tr '\n' ' ')"
+  fi
+}
+appversion_images "grid-operator" "$CHART_DIR"
+appversion_images "grid-enrollment" charts/grid-enrollment
+appversion_images "grid-mock-providers" charts/grid-mock-providers
+appversion_images "praxis-gateway" "$GW_DIR" --set praxisConfig.byo.configMapName=cfg
+
 echo "=== Renders twice to identical bytes ==="
 # same_render <label> <helm template args...>
 same_render() {
