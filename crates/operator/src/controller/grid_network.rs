@@ -2201,6 +2201,7 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
         memory.retain_network_keys(name, admission_keys.iter().cloned());
     }
 
+    let grid_id = network.spec.grid_id.clone();
     let remote_crdt_providers: Vec<crdt::ProviderState> = if reads_polled_catalogs(ctx.membership()) {
         ctx.peer_providers()
             .admit(name, &reserved_clusters(&network, &providers), &hop_sites(&network))
@@ -2209,6 +2210,7 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
             .map(|swim| collect_remote_crdt_providers(swim, name))
             .unwrap_or_default()
     };
+    let remote_model_inventories = ctx.swim().map(|swim| swim.model_inventories()).unwrap_or_default();
 
     // Obtain a live membership snapshot here - used both for staleness override below
     // and for phase determination after the overlay step.
@@ -2226,12 +2228,15 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
         mount_statuses: mount_reconciliation_statuses,
         overlay_statuses,
         serving_retry,
+        inventory_expiry_deadline,
     } = Box::pin(reconcile_routing_overlay_inner(
         &network,
+        &grid_id,
         client,
         &providers,
         &tool_providers,
         &remote_crdt_providers,
+        &remote_model_inventories,
         &ctx.served_models,
         &raw_metrics,
         &scoring_weights,
@@ -2241,7 +2246,6 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
     ))
     .await?;
 
-    let grid_id = network.spec.grid_id.clone();
     // An expired or unreadable identity, as IdentityValid reports it, degrades the network.
     let identity_failed = network.status.as_ref().is_some_and(|status| {
         held_condition(&status.conditions, crate::enroll::local::IDENTITY_VALID)
@@ -2311,10 +2315,72 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
         reconcile_discovered_sites(&ctx, &network, name, swim.site_name(), snapshot).await?;
     }
 
-    // A deferred serving write lands as soon as its spacing allows.
-    Ok(Action::requeue(
-        serving_retry.map_or(requeue_interval, |wait| requeue_interval.min(wait)),
-    ))
+    // A deferred serving write lands as soon as its spacing allows. Discovered inventory
+    // candidates also set a deadline so both generated router configs are refreshed on expiry.
+    let retry = soonest_reconcile_retry(
+        requeue_interval,
+        serving_retry,
+        inventory_expiry_deadline,
+        time::OffsetDateTime::now_utc(),
+    );
+    Ok(Action::requeue(retry))
+}
+
+/// Requeue at the earliest discovered-model deadline still present in a gateway overlay.
+///
+/// The next reconcile re-renders each router config after the inventory renderer has dropped
+/// expired models. This covers both the generated Praxis router and the embedded Grid router.
+fn next_discovered_model_expiry(overlay: &routing_overlay::RoutingOverlay) -> Option<time::OffsetDateTime> {
+    overlay
+        .candidates
+        .iter()
+        .chain(&overlay.excluded)
+        .filter_map(|candidate| {
+            let expires_at = candidate.expires_at.as_deref()?;
+            time::OffsetDateTime::parse(expires_at, &time::format_description::well_known::Rfc3339).ok()
+        })
+        .min()
+}
+
+/// Convert an absolute inventory deadline to a positive controller requeue delay.
+fn wait_until_deadline(deadline: time::OffsetDateTime, now: time::OffsetDateTime) -> Duration {
+    let wait_nanos = deadline
+        .unix_timestamp_nanos()
+        .saturating_sub(now.unix_timestamp_nanos())
+        .max(1);
+    let wait_millis = wait_nanos.saturating_add(999_999) / 1_000_000;
+    Duration::from_millis(u64::try_from(wait_millis).unwrap_or(u64::MAX))
+}
+
+/// Wake well before the gateway's 30-second expiry cutoff, retrying briefly when inside the lead.
+fn inventory_expiry_retry(deadline: time::OffsetDateTime, now: time::OffsetDateTime) -> Duration {
+    const RECONCILE_LEAD: Duration = Duration::from_secs(60);
+    const LATE_RETRY_MAX: Duration = Duration::from_secs(10);
+
+    if deadline <= now {
+        return Duration::from_secs(1);
+    }
+    let until_deadline = wait_until_deadline(deadline, now);
+    if until_deadline > RECONCILE_LEAD {
+        return until_deadline.saturating_sub(RECONCILE_LEAD);
+    }
+    let half_wait = Duration::from_nanos(u64::try_from(until_deadline.as_nanos() / 2).unwrap_or(0));
+    half_wait.min(LATE_RETRY_MAX).max(Duration::from_nanos(1))
+}
+
+/// Choose the earliest normal, deferred-write, or discovered-inventory requeue.
+fn soonest_reconcile_retry(
+    normal_retry: Duration,
+    serving_retry: Option<Duration>,
+    inventory_expiry_deadline: Option<time::OffsetDateTime>,
+    now: time::OffsetDateTime,
+) -> Duration {
+    let expiry_retry = inventory_expiry_deadline.map(|deadline| inventory_expiry_retry(deadline, now));
+    [Some(normal_retry), serving_retry, expiry_retry]
+        .into_iter()
+        .flatten()
+        .min()
+        .unwrap_or(normal_retry)
 }
 
 /// Manager for the `GridNetwork`'s `Available`, `Progressing` and `Degraded`, written only here.
@@ -2973,10 +3039,12 @@ fn site_phases(sites: &[GridSite]) -> impl Iterator<Item = (&str, &'static str)>
 )]
 async fn reconcile_routing_overlay_inner(
     network: &GridNetwork,
+    grid_id: &str,
     client: &Client,
     providers: &[InferenceProvider],
     tool_providers: &[AgentToolProvider],
     remote_crdt_providers: &[crdt::ProviderState],
+    remote_model_inventories: &[swim::ModelInventory],
     served_model_store: &served_models::ServedModelStore,
     raw_metrics: &HashMap<String, scoring::BackendMetrics>,
     scoring_weights: &scoring::ScoringWeights,
@@ -3006,6 +3074,7 @@ async fn reconcile_routing_overlay_inner(
     let mut mount_statuses: Vec<MountReconciliationStatus> = Vec::new();
     let mut overlay_statuses: Vec<OverlayRevisionStatus> = Vec::new();
     let mut serving_retry: Option<Duration> = None;
+    let mut inventory_expiry_deadline: Option<time::OffsetDateTime> = None;
 
     for gw_ref in &network.spec.consumer_gateways {
         // Each gateway identifies its own local site.  Fall back to the
@@ -3039,6 +3108,8 @@ async fn reconcile_routing_overlay_inner(
             providers,
             tool_providers,
             &eligible_remote_owned,
+            remote_model_inventories,
+            grid_id,
             local_site,
             owning_site,
             metrics_arg,
@@ -3046,6 +3117,11 @@ async fn reconcile_routing_overlay_inner(
             scoring_weights,
             Some(admission_states),
             served_model_store,
+            if gw_ref.supports_model_discovery_contract() {
+                routing_overlay::CandidateExpirySupport::Supported
+            } else {
+                routing_overlay::CandidateExpirySupport::Unsupported
+            },
         ) {
             Ok(overlay) => overlay,
             Err(error) => {
@@ -3066,6 +3142,10 @@ async fn reconcile_routing_overlay_inner(
                 continue;
             },
         };
+        if let Some(deadline) = next_discovered_model_expiry(&overlay) {
+            inventory_expiry_deadline =
+                Some(inventory_expiry_deadline.map_or(deadline, |current| current.min(deadline)));
+        }
         let (cluster_endpoints, derived_summary, refused) = gateway_cluster_endpoints(
             gw_ref,
             &overlay.candidates,
@@ -3363,6 +3443,7 @@ async fn reconcile_routing_overlay_inner(
         mount_statuses,
         overlay_statuses,
         serving_retry,
+        inventory_expiry_deadline,
     })
 }
 
@@ -3380,6 +3461,8 @@ struct OverlayOutcome {
     overlay_statuses: Vec<OverlayRevisionStatus>,
     /// Soonest a deferred serving config write can land.
     serving_retry: Option<Duration>,
+    /// Soonest a discovered model inventory expires.
+    inventory_expiry_deadline: Option<time::OffsetDateTime>,
 }
 
 /// What the serving config renders from, present only under poll.
@@ -5744,7 +5827,7 @@ fn upsert_provider_with_capabilities(
         }
     }
     // Tool names are NOT registered as Capability::Tool in the OR-set.
-    // They travel in the BroadcastExtension's `provider_tools` map and are
+    // They travel in the versioned provider-state extension and are
     // stored directly on the ProviderState. Duplicating them as capabilities
     // would bloat the SWIM byte budget for providers with large tool catalogs.
     snap.upsert_provider(state);
@@ -5838,6 +5921,26 @@ fn retain_tool_catalogs_within_budget(
 /// Maximum DER-encoded ECDSA P-256 signature size.
 const MAX_P256_DER_SIGNATURE_BYTES: usize = 72;
 
+/// Retain whole provider UID records only while the inference snapshot remains transport-safe.
+///
+/// UID values are identity tokens and are never truncated. Providers whose UID metadata does not
+/// fit still remain in the provider snapshot; their discovered inventories will be ignored until
+/// a later snapshot can carry the matching UID.
+fn fit_provider_uids_to_swim_budget(broadcast: &mut swim::StateBroadcast, byte_budget: usize) -> usize {
+    let mut offered = std::mem::take(&mut broadcast.provider_uids);
+    offered.sort_by(|left, right| left.identity.cmp(&right.identity));
+    let mut dropped = 0_usize;
+    for provider_uid in offered {
+        broadcast.provider_uids.push(provider_uid);
+        if !broadcast.encode().is_ok_and(|encoded| encoded.len() <= byte_budget)
+            && broadcast.provider_uids.pop().is_some()
+        {
+            dropped = dropped.saturating_add(1);
+        }
+    }
+    dropped
+}
+
 /// Deterministically trim tool catalogs until the encoded state fits SWIM.
 ///
 /// Inference provider records and capabilities are never removed. Tool
@@ -5853,6 +5956,7 @@ fn fit_provider_tools_to_swim_budget(broadcast: &mut swim::StateBroadcast) {
     let catalogs = detach_tool_catalogs(broadcast);
     let providers_offered = catalogs.len();
     let offered = catalogs.iter().map(|catalog| catalog.tools.len()).sum::<usize>();
+    let provider_uids_dropped = fit_provider_uids_to_swim_budget(broadcast, byte_budget);
     let baseline_fits = broadcast.encode().is_ok_and(|encoded| encoded.len() <= byte_budget);
     let retained = if baseline_fits {
         retain_tool_catalogs_within_budget(broadcast, &catalogs, byte_budget)
@@ -5877,8 +5981,9 @@ fn fit_provider_tools_to_swim_budget(broadcast: &mut swim::StateBroadcast) {
         offered,
         retained,
         dropped = offered.saturating_sub(retained),
+        provider_uids_dropped,
         byte_budget,
-        "trimmed MCP tool providers and catalogs to fit the SWIM broadcast budget"
+        "trimmed provider UID metadata and MCP tool catalogs to fit the SWIM broadcast budget"
     );
 }
 
@@ -5968,6 +6073,7 @@ fn publish_real_provider_state(
     let site_name = swim.site_name();
     let mut snap = crdt::GridStateSnapshot::new(site_name.to_owned());
     let mut max_revision: u64 = 0;
+    let mut provider_uids = Vec::new();
 
     for provider in providers {
         if provider.spec.grid_network_ref != network_name {
@@ -5975,7 +6081,13 @@ fn publish_real_provider_state(
         }
         let routing_id = routing_overlay::routing_identity(provider).unwrap_or("");
         let metrics = raw_metrics.get(routing_id).copied();
-        if let Some(state) = provider_state_from_kube(provider, network_name, site_name, metrics, served_model_store) {
+        let provider_state = provider_state_from_kube(provider, network_name, site_name, metrics, served_model_store);
+        if let Some(state) = provider_state {
+            if provider.spec.model_discovery.is_some()
+                && let Some(uid) = provider.metadata.uid.as_deref()
+            {
+                provider_uids.push(provider_uid_from_state(uid.to_owned(), &state));
+            }
             upsert_provider_with_capabilities(&mut snap, &mut max_revision, state);
         }
     }
@@ -5991,7 +6103,8 @@ fn publish_real_provider_state(
         }
     }
 
-    let mut bc = provider_state_broadcast(site_name, grid_id, max_revision, snap, swim.gateway_address());
+    let mut bc = provider_state_broadcast(site_name, grid_id, max_revision, snap, swim.gateway_address())
+        .with_provider_uids(provider_uids);
     fit_provider_tools_to_swim_budget(&mut bc);
     if let Err(e) = swim.publish_state_broadcast(bc) {
         tracing::debug!(error = %e, "CRDT broadcast channel unavailable (runtime not yet receiving)");
@@ -6016,6 +6129,16 @@ fn local_wire_providers(
         .filter_map(|provider| tool_provider_state_from_kube(provider, network_name, ""))
         .filter(|state| !state.tools.is_empty());
     inference.chain(tools).map(site_providers::WireProvider::from).collect()
+}
+
+/// Associate a Kubernetes provider UID with the identity published in CRDT state.
+fn provider_uid_from_state(uid: String, state: &crdt::ProviderState) -> swim::ProviderUid {
+    let identity = swim::ProviderIdentity {
+        network: state.network_id.clone(),
+        site: state.site_id.clone(),
+        provider: state.provider_id.clone(),
+    };
+    swim::ProviderUid { identity, uid }
 }
 
 /// Count provider records learned from remote sites through distributed state.
@@ -11155,6 +11278,7 @@ mod tests {
             name: name.to_owned(),
             namespace: ns.to_owned(),
             site_name: None,
+            model_discovery_contract_version: None,
             provider_hop_endpoints: Vec::new(),
             praxis_config: None,
         }
@@ -13105,7 +13229,7 @@ mod tests {
             ("site-a", "tool/mcp-server"),
             "the eligible provider must retain its source site and tool identity"
         );
-        let excluded_candidates = routing_overlay::remote_crdt_provider_to_candidates(&inactive_provider);
+        let excluded_candidates = routing_overlay::remote_crdt_provider_to_candidates(&inactive_provider, &[], "");
         assert!(
             !excluded_candidates.is_empty(),
             "the inactive-site provider carries tools so it would produce candidates if not filtered"
@@ -13245,6 +13369,60 @@ mod tests {
             requeue_interval_for_network(&base_network(), &providers).ok(),
             Some(REQUEUE_INTERVAL),
             "networks with no TLS providers should use 300s"
+        );
+    }
+
+    #[test]
+    fn discovered_model_expiry_uses_the_earliest_routable_or_excluded_candidate() {
+        let mut routable = topology_candidate("cluster-a", "site-a");
+        routable.expires_at = Some("2030-01-01T00:00:30Z".to_owned());
+        let mut excluded = topology_candidate("cluster-b", "site-b");
+        excluded.expires_at = Some("2030-01-01T00:00:10Z".to_owned());
+        let overlay = routing_overlay::RoutingOverlay {
+            network: "net".to_owned(),
+            local_site: "site-a".to_owned(),
+            candidates: vec![routable],
+            excluded: vec![excluded],
+            selection_policy: None,
+            generated_at: None,
+        };
+        let expected =
+            time::OffsetDateTime::parse("2030-01-01T00:00:10Z", &time::format_description::well_known::Rfc3339)
+                .unwrap_or_else(|_| std::process::abort());
+
+        assert_eq!(
+            next_discovered_model_expiry(&overlay),
+            Some(expected),
+            "excluded candidates also remain in serving config until their inventory expires"
+        );
+    }
+
+    #[test]
+    fn discovered_model_expiry_retries_before_gateway_cutoff() {
+        let now = time::OffsetDateTime::parse("2030-01-01T00:00:00Z", &time::format_description::well_known::Rfc3339)
+            .unwrap_or_else(|_| std::process::abort());
+        let normal_retry = Duration::from_secs(300);
+        let serving_retry = Some(Duration::from_secs(10));
+
+        assert_eq!(
+            soonest_reconcile_retry(normal_retry, serving_retry, Some(now + time::Duration::seconds(5)), now,),
+            Duration::from_secs(2) + Duration::from_millis(500),
+            "a deadline inside the lead window must retry before the deadline"
+        );
+        assert_eq!(
+            soonest_reconcile_retry(normal_retry, serving_retry, Some(now - time::Duration::seconds(1)), now,),
+            Duration::from_secs(1),
+            "a deadline reached during reconciliation must still schedule a bounded short retry"
+        );
+        assert_eq!(
+            inventory_expiry_retry(now + time::Duration::seconds(120), now),
+            Duration::from_secs(60),
+            "a deadline 120 seconds away must requeue no later than 60 seconds"
+        );
+        let inside_lead = inventory_expiry_retry(now + time::Duration::seconds(20), now);
+        assert!(
+            inside_lead < Duration::from_secs(20),
+            "a deadline inside the lead window must requeue before the deadline"
         );
     }
 
@@ -13554,8 +13732,8 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// Tool names are stored on the provider record, NOT as `Capability::Tool`
-    /// in the OR-set. They travel in the `BroadcastExtension`'s `provider_tools`
-    /// map. This test verifies the provider is upserted with tools intact and
+    /// in the OR-set. They travel in the versioned provider-state extension.
+    /// This test verifies the provider is upserted with tools intact and
     /// that no `Capability::Tool` entries are created.
     #[test]
     fn upsert_tool_provider_stores_tools_on_provider_not_as_capabilities() {
@@ -13728,6 +13906,61 @@ mod tests {
                 .values()
                 .any(|provider| !provider.tools.is_empty()),
             "the fair fit should retain at least one reachable tool provider"
+        );
+    }
+
+    #[test]
+    fn uid_metadata_cannot_overflow_an_otherwise_fitting_inference_snapshot() {
+        let local_id = worst_case_swim_identity("site-a");
+        let budget = swim::node::state_broadcast_byte_budget(&local_id).unwrap_or_else(|_| std::process::abort());
+        let uid = swim::ProviderUid {
+            identity: swim::ProviderIdentity {
+                network: "net".to_owned(),
+                site: "site-a".to_owned(),
+                provider: "inference".to_owned(),
+            },
+            uid: "uid-entire-and-never-truncated".to_owned(),
+        };
+        let make_broadcast = |model: &str| {
+            let mut snapshot = crdt::GridStateSnapshot::new("site-a".to_owned());
+            let mut state = provider_state("site-a", "inference");
+            state.models = vec![model.to_owned()];
+            let mut max_revision = 0;
+            upsert_provider_with_capabilities(&mut snapshot, &mut max_revision, state);
+            provider_state_broadcast("site-a", "grid", max_revision, snapshot, None)
+        };
+        let mut model = String::new();
+        let mut baseline = None;
+        for _ in 0..budget {
+            let candidate = make_broadcast(&model);
+            let candidate_fits = candidate.encode().is_ok_and(|encoded| encoded.len() <= budget);
+            let with_uid_fits = candidate
+                .clone()
+                .with_provider_uids(vec![uid.clone()])
+                .encode()
+                .is_ok_and(|encoded| encoded.len() <= budget);
+            if candidate_fits && !with_uid_fits {
+                baseline = Some(candidate);
+                break;
+            }
+            model.push('x');
+        }
+        let mut broadcast = baseline
+            .unwrap_or_else(|| std::process::abort())
+            .with_provider_uids(vec![uid]);
+
+        assert!(
+            !broadcast.encode().is_ok_and(|encoded| encoded.len() <= budget),
+            "the UID metadata pushes this inference snapshot past the transport budget"
+        );
+        fit_provider_tools_to_swim_budget(&mut broadcast);
+
+        let encoded = broadcast.encode().unwrap_or_else(|_| std::process::abort());
+        assert!(encoded.len() <= budget);
+        assert!(broadcast.snapshot.providers.contains_key("net/site-a/inference"));
+        assert!(
+            broadcast.provider_uids.is_empty(),
+            "the complete UID is omitted rather than truncated"
         );
     }
 }

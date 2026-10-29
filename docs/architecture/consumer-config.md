@@ -199,12 +199,19 @@ an empty list in arbitrary startup YAML:
 |---|---|---|---|
 | Praxis `intelligent_route` with `overlay_file` | Grid's versioned `routing-overlay.json` ConfigMap | A valid versioned envelope whose `overlay.candidates` is `[]` | Praxis validates and atomically serves the new snapshot; malformed replacements retain last-known-good. |
 | Generated `GatewayRef.praxisConfig` | The same scoped versioned overlay; generated `praxis.yaml` supplies filter and endpoint plumbing | The same empty envelope | Candidate-only updates hot reload. Credential-bearing revisions are held until `enableProjectedCredentials` has been rolled out and `supportsProjectedCredentials: true` attests the filter and Secret mounts are active. Listener, endpoint/TLS, and filter-pipeline changes still require the consumer owner to reload or roll out its Praxis configuration. |
-| Embedded `grid-gateway` `grid_site_route` filter | The operator-published `grid-serving-<network>-<gateway>` ConfigMap | A valid serving config with `candidates: []` | The running gateway watches the projected serving file and atomically replaces its candidate snapshot and provider-hop allowlist. Malformed updates retain the previous snapshot. Provider-hop trust is declared separately with `GatewayRef.providerHopEndpoints`. |
+| Embedded `grid-gateway` `grid_site_route` filter | The operator-published `grid-serving-<network>-<gateway>` ConfigMap | A valid serving config with `candidates: []` | The running gateway watches the projected serving file and atomically replaces its candidate snapshot and provider-hop allowlist. Discovered candidates carry `expires_at_ms`, checked during route selection even if config delivery stops. Malformed updates retain the previous snapshot. Provider-hop trust is declared separately with `GatewayRef.providerHopEndpoints`. |
 
 Grid publishes authoritative empty revisions without a capability flag. Every
 consumer of a gateway's overlay must therefore run an image with empty-snapshot
 support before this Grid version is deployed. The paired AI change and a
 compatible image release are prerequisites for the next Grid release.
+
+For discovered models, set `GatewayRef.modelDiscoveryContractVersion: v1`
+only after the running Praxis image implements the model-discovery contract. Without that
+declaration, Grid withholds discovered candidates from that gateway. The `v1`
+model-discovery contract carries `expires_at` as RFC 3339 UTC and expires the route
+when gateway UTC reaches the deadline minus 30 seconds, covering up to 30
+seconds of clock lag.
 
 The embedded gateway's filter chain and upstream cluster definitions remain in
 its startup Praxis configuration, but its changing candidate list is not a
