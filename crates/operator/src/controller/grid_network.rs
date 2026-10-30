@@ -2243,6 +2243,7 @@ pub async fn reconcile(network: Arc<GridNetwork>, ctx: Arc<OperatorCtx>) -> Resu
         &admission_states,
         serving.as_ref(),
         ctx.site_name(),
+        reads_polled_catalogs(ctx.membership()),
     ))
     .await?;
 
@@ -3051,6 +3052,7 @@ async fn reconcile_routing_overlay_inner(
     admission_states: &HashMap<String, crate::resources::geography::AdmissionState>,
     serving: Option<&ServingSource<'_>>,
     owning_site: Option<&str>,
+    member_catalogs: bool,
 ) -> Result<OverlayOutcome, OperatorError> {
     let network_name = grid_network_name(network)?;
     let signal = GridModes::of(network, MembershipMode::Swim).signal;
@@ -3075,6 +3077,15 @@ async fn reconcile_routing_overlay_inner(
     let mut overlay_statuses: Vec<OverlayRevisionStatus> = Vec::new();
     let mut serving_retry: Option<Duration> = None;
     let mut inventory_expiry_deadline: Option<time::OffsetDateTime> = None;
+    // Peer records are the same for every gateway; only Local reads them from verified peers.
+    let peer_catalog = member_catalogs.then(|| {
+        derived_topology::peer_catalog(filter_eligible_remote_crdt_providers(
+            network_name,
+            &sites,
+            remote_crdt_providers,
+            signal,
+        ))
+    });
 
     for gw_ref in &network.spec.consumer_gateways {
         // Each gateway identifies its own local site.  Fall back to the
@@ -3157,6 +3168,7 @@ async fn reconcile_routing_overlay_inner(
                 from_providers: &[],
                 transport: None,
                 signal,
+                peer_catalog: peer_catalog.as_ref(),
             },
         );
         if !refused.is_empty() {
@@ -11825,6 +11837,7 @@ mod tests {
             from_providers: &[],
             transport: None,
             signal: SignalMode::Gossip,
+            peer_catalog: None,
         }
     }
 
@@ -12106,33 +12119,21 @@ mod tests {
     }
 
     #[test]
-    fn narrowing_and_removing_the_allowlist_withdraws_the_revoked_endpoint_from_the_render() {
-        let providers = vec![
-            local_http_provider("prov-a", "prov-a.models.svc"),
-            local_http_provider("prov-b", "prov-b.models.svc"),
-        ];
-        let declarations = derived_topology::Declarations {
-            providers: &providers,
-            ..empty_declarations()
-        };
-        let allow = |names: &[&str]| {
-            Some(crate::crd::grid_network::DeriveTopology {
-                from_providers: names.iter().map(|name| (*name).to_owned()).collect(),
-                transport: None,
-            })
-        };
-        // The typed entry keeps the inventory non-empty once every derivation is revoked.
-        let steps = [
-            (allow(&["prov-a", "prov-b"]), &["prov-a", "prov-b"][..]),
-            (allow(&["prov-a"]), &["prov-a"][..]),
-            (allow(&[]), &[][..]),
-            (None, &[][..]),
-        ];
-        for (derive_topology, live) in steps {
+    fn removing_a_provider_withdraws_its_derived_endpoint_from_the_render() {
+        // The typed entry keeps the inventory non-empty once every provider is gone.
+        let steps: [&[&str]; 3] = [&["prov-a", "prov-b"], &["prov-a"], &[]];
+        for live in steps {
+            let providers: Vec<InferenceProvider> = live
+                .iter()
+                .map(|name| local_http_provider(name, &format!("{name}.models.svc")))
+                .collect();
+            let declarations = derived_topology::Declarations {
+                providers: &providers,
+                ..empty_declarations()
+            };
             let mut gw = make_gw_ref("inference-gw", "praxis-system");
             gw.site_name = Some("site-a".to_owned());
             let cc = ConsumerConfig {
-                derive_topology,
                 cluster_endpoints: vec![typed_endpoint("typed-c", "typed-c.models.svc:8000")],
                 ..make_consumer_config("praxis-consumer-config")
             };
@@ -12172,15 +12173,15 @@ mod tests {
                 assert_eq!(
                     rendered.config_yaml.contains(&address),
                     live.contains(&cluster),
-                    "{live:?}: {address} is live only while allowlisted"
+                    "{live:?}: {address} is live only while its provider exists"
                 );
                 assert_eq!(
                     overlay.candidates.iter().any(|c| c.cluster == cluster),
                     live.contains(&cluster),
-                    "{live:?}: {cluster} routes only while allowlisted"
+                    "{live:?}: {cluster} routes only while its provider exists"
                 );
                 assert_eq!(
-                    summary.contains(&format!("{cluster}: not allowlisted")),
+                    summary.contains(&format!("{cluster}: no provider")),
                     !live.contains(&cluster),
                     "{live:?}: the status names {cluster} once withdrawn: {summary}"
                 );
